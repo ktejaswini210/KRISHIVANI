@@ -1,0 +1,159 @@
+from flask import Flask, jsonify, render_template, request
+from openpyxl import load_workbook
+from datetime import datetime, timedelta
+from pathlib import Path
+import random
+
+app = Flask(__name__)
+BASE = Path(__file__).resolve().parent
+EXCEL_FILE = BASE / "vegetable_data.xlsx"
+
+
+def load_vegetables():
+    wb = load_workbook(EXCEL_FILE, data_only=True)
+    ws = wb["VegetableData"]
+    headers = [c.value for c in ws[1]]
+    return [dict(zip(headers, row)) for row in ws.iter_rows(min_row=2, values_only=True)]
+
+
+VEGETABLES = load_vegetables()
+
+# ONLY WEIGHT IS MANUALLY ENTERED.
+# Temperature and humidity are automatic demo sensor values.
+state = {
+    "tray_id": "TRAY-01",
+    "weight_kg": 20.0,
+    "temperature_c": 12.0,
+    "humidity": 85.0,
+    "harvest_date": datetime.now().strftime("%Y-%m-%d"),
+}
+
+
+def get_record():
+    return next(v for v in VEGETABLES if v["tray_id"] == state["tray_id"])
+
+
+def analyse():
+    record = get_record()
+    temp = float(state["temperature_c"])
+    humidity = float(state["humidity"])
+    weight = float(state["weight_kg"])
+    harvest = datetime.strptime(str(state["harvest_date"]), "%Y-%m-%d")
+    days_stored = max(0, (datetime.now() - harvest).days)
+    max_days = int(record["max_storage_days"])
+
+    temp_ok = record["min_temp_c"] <= temp <= record["max_temp_c"]
+    humidity_ok = record["min_humidity"] <= humidity <= record["max_humidity"]
+    age_ratio = days_stored / max_days if max_days else 1
+    bad_conditions = int(not temp_ok) + int(not humidity_ok)
+
+    if days_stored >= max_days or bad_conditions == 2:
+        risk = "High Risk"
+        status = "Affected / Sell Immediately"
+    elif age_ratio >= 0.70 or bad_conditions == 1:
+        risk = "Medium Risk"
+        status = "Monitor / Sell Soon"
+    else:
+        risk = "Low Risk"
+        status = "Fresh"
+
+    sell_after = int(record["recommended_sell_after_days"])
+    remaining_sell_days = max(0, sell_after - days_stored)
+    sell_message = "Recommended selling time: NOW" if remaining_sell_days == 0 else f"Recommended selling time: within {remaining_sell_days} day(s)"
+    remaining_storage = max(0, max_days - days_stored)
+
+    if risk == "High Risk":
+        alert = f"FARMER ALERT: {record['vegetable']} is at high risk. {record['alert_message']}"
+    elif risk == "Medium Risk":
+        alert = f"FARMER WARNING: {record['vegetable']} needs attention. Consider selling soon."
+    else:
+        alert = ""
+
+    return {
+        "tray_id": record["tray_id"],
+        "vegetable": record["vegetable"],
+        "weight_kg": round(weight, 1),
+        "temperature_c": round(temp, 1),
+        "humidity": round(humidity, 1),
+        "recommended_temperature": f"{record['min_temp_c']}–{record['max_temp_c']} °C",
+        "recommended_humidity": f"{record['min_humidity']}–{record['max_humidity']} %",
+        "days_stored": days_stored,
+        "max_storage_days": max_days,
+        "remaining_storage_days": remaining_storage,
+        "risk": risk,
+        "status": status,
+        "temperature_ok": temp_ok,
+        "humidity_ok": humidity_ok,
+        "sell_message": sell_message,
+        "storage_message": f"You can store it for approximately {remaining_storage} more day(s).",
+        "alert": alert,
+        "temperature_source": "Automatic sensor / ESP32",
+        "humidity_source": "Automatic sensor / ESP32",
+        "weight_source": "Manual farmer entry",
+    }
+
+
+@app.route("/")
+def home():
+    return render_template("index.html")
+
+
+@app.route("/api/data")
+def data():
+    return jsonify(analyse())
+
+
+@app.route("/api/weight", methods=["POST"])
+def update_weight():
+    payload = request.get_json(silent=True) or {}
+    try:
+        weight = float(payload.get("weight_kg"))
+        if weight < 0 or weight > 10000:
+            raise ValueError
+    except (TypeError, ValueError):
+        return jsonify({"error": "Enter a valid weight in kg."}), 400
+
+    state["weight_kg"] = weight
+    return jsonify(analyse())
+
+
+@app.route("/api/demo/<int:number>/<mode>")
+def demo(number, mode):
+    if number < 1 or number > len(VEGETABLES):
+        return jsonify({"error": "Invalid tray"}), 400
+    if mode not in ["normal", "medium", "high"]:
+        return jsonify({"error": "Invalid mode"}), 400
+
+    record = VEGETABLES[number - 1]
+    state["tray_id"] = record["tray_id"]
+
+    # Demo only: weight is NOT changed here. The manually entered weight remains.
+    if mode == "normal":
+        age_days = 0
+        state["temperature_c"] = round((record["min_temp_c"] + record["max_temp_c"]) / 2, 1)
+        state["humidity"] = round((record["min_humidity"] + record["max_humidity"]) / 2, 1)
+    elif mode == "medium":
+        age_days = max(1, int(record["max_storage_days"] * 0.75))
+        state["temperature_c"] = round(record["max_temp_c"] + 2, 1)
+        state["humidity"] = round((record["min_humidity"] + record["max_humidity"]) / 2, 1)
+    else:
+        age_days = int(record["max_storage_days"]) + 1
+        state["temperature_c"] = round(record["max_temp_c"] + 8, 1)
+        state["humidity"] = max(0, round(record["min_humidity"] - 20, 1))
+
+    state["harvest_date"] = (datetime.now() - timedelta(days=age_days)).strftime("%Y-%m-%d")
+    return jsonify(analyse())
+
+
+@app.route("/api/sensor", methods=["POST"])
+def sensor():
+    payload = request.get_json(silent=True) or {}
+    for key in ["tray_id", "temperature_c", "humidity", "harvest_date"]:
+        if key in payload:
+            state[key] = payload[key]
+    # Weight intentionally stays manual; it is not accepted from this sensor endpoint.
+    return jsonify(analyse())
+
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=5000, debug=True)
